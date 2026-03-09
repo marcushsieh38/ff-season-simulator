@@ -3,6 +3,9 @@ import numpy as np
 import pandas as pd
 import requests
 import gc
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Sleeper Season Sim", page_icon="🏈", layout="wide", initial_sidebar_state="collapsed")
 
@@ -355,6 +358,13 @@ def build_luck_table(rosters_data, results):
 st.markdown('<div class="hero-title">SLEEPER<br>SEASON SIM</div>', unsafe_allow_html=True)
 st.markdown('<div class="hero-sub">Bayesian Monte Carlo Resimulation &nbsp;·&nbsp; Completed Season Analysis &nbsp;·&nbsp; Luck Index</div>', unsafe_allow_html=True)
 
+# ── session-state keys ──────────────────────────────────────────────────────
+for _k in ("sim_results", "sim_summary_table", "sim_luck_table",
+           "sim_league_name", "sim_season_year", "sim_num_teams",
+           "sim_num_weeks", "sim_num_players", "sim_num_sims"):
+    if _k not in st.session_state:
+        st.session_state[_k] = None
+
 league_id_input = st.text_input("Completed Season League ID", placeholder="Paste your Sleeper league ID here")
 num_sims = st.select_slider("Simulation Iterations", options=[1000, 2500, 5000, 10000], value=5000)
 st.markdown('<div class="info-box">Enter the League ID of a <strong>finished season</strong>. The sim replays every week using the real starters each team set and the actual matchup schedule, then compares what did happen to what should have happened across thousands of alternate universes.</div>', unsafe_allow_html=True)
@@ -426,19 +436,41 @@ if run_simulation:
     status_text.empty()
     progress_bar.empty()
 
-    league_name = league_info.get("name", "Your League")
-    season_year = league_info.get("season", "")
+    # ── persist everything to session state ──────────────────────────────────
+    st.session_state.sim_results = results
+    st.session_state.sim_summary_table = summary_table
+    st.session_state.sim_luck_table = luck_table
+    st.session_state.sim_league_name = league_info.get("name", "Your League")
+    st.session_state.sim_season_year = league_info.get("season", "")
+    st.session_state.sim_num_teams = num_teams
+    st.session_state.sim_num_weeks = num_regular_season_weeks
+    st.session_state.sim_num_players = len(player_stats)
+    st.session_state.sim_num_sims = num_sims
+
+
+# ── render results (from session state, survives tab/widget interactions) ────
+if st.session_state.sim_results is not None:
+    results        = st.session_state.sim_results
+    summary_table  = st.session_state.sim_summary_table
+    luck_table     = st.session_state.sim_luck_table
+    league_name    = st.session_state.sim_league_name
+    season_year    = st.session_state.sim_season_year
+    num_teams      = st.session_state.sim_num_teams
+    num_regular_season_weeks = st.session_state.sim_num_weeks
+    num_players    = st.session_state.sim_num_players
+    num_sims       = st.session_state.sim_num_sims
+
     st.markdown(f'<div class="section-header">{league_name.upper()} {season_year} — RESIMULATION RESULTS</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="info-box">🟢 {num_regular_season_weeks}-week regular season replayed with real lineups &nbsp;·&nbsp; {num_sims:,} simulations &nbsp;·&nbsp; {len(player_stats):,} starters modeled</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="info-box">🟢 {num_regular_season_weeks}-week regular season replayed with real lineups &nbsp;·&nbsp; {num_sims:,} simulations &nbsp;·&nbsp; {num_players:,} starters modeled</div>', unsafe_allow_html=True)
 
     c1, c2, c3, c4 = st.columns(4)
     with c1: st.markdown(f'<div class="stat-card"><div class="stat-value">{num_teams}</div><div class="stat-label">Teams</div></div>', unsafe_allow_html=True)
     with c2: st.markdown(f'<div class="stat-card"><div class="stat-value">{num_regular_season_weeks}</div><div class="stat-label">Weeks Replayed</div></div>', unsafe_allow_html=True)
-    with c3: st.markdown(f'<div class="stat-card"><div class="stat-value">{len(player_stats):,}</div><div class="stat-label">Players Modeled</div></div>', unsafe_allow_html=True)
+    with c3: st.markdown(f'<div class="stat-card"><div class="stat-value">{num_players:,}</div><div class="stat-label">Players Modeled</div></div>', unsafe_allow_html=True)
     with c4: st.markdown(f'<div class="stat-card"><div class="stat-value">{num_sims:,}</div><div class="stat-label">Simulations</div></div>', unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
-    tab1, tab2, tab3 = st.tabs(["📋 Season Summary", "📈 Win Distribution", "🍀 Luck Index"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📋 Season Summary", "📈 Win Distribution", "🍀 Luck Index", "🔬 Convergence"])
 
     with tab1:
         st.markdown('<div class="section-header">ACTUAL VS SIMULATED SEASON</div>', unsafe_allow_html=True)
@@ -455,17 +487,55 @@ if run_simulation:
             height=min(520, 70 + 38 * num_teams)
         )
 
+        # ── Bar chart: actual wins vs sim expected wins ──────────────────────
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<div class="section-header" style="font-size:1.2rem;">ACTUAL VS EXPECTED WINS</div>', unsafe_allow_html=True)
+        team_names_sorted = [results["team_names"][i] for i in np.argsort(results["actual_wins_by_idx"])[::-1]]
+        actual_sorted = sorted(results["actual_wins_by_idx"], reverse=True)
+        mean_sorted = [results["mean_wins"][results["team_names"].index(t)] for t in team_names_sorted]
+        std_sorted = [results["std_wins"][results["team_names"].index(t)] for t in team_names_sorted]
+
+        fig_bar = go.Figure()
+        fig_bar.add_trace(go.Bar(
+            name="Sim Expected",
+            x=team_names_sorted,
+            y=mean_sorted,
+            error_y=dict(type="data", array=std_sorted, visible=True, color="rgba(79,156,249,0.5)"),
+            marker_color="rgba(79,156,249,0.6)",
+            marker_line_color="rgba(79,156,249,1)",
+            marker_line_width=1,
+        ))
+        fig_bar.add_trace(go.Scatter(
+            name="Actual Wins",
+            x=team_names_sorted,
+            y=actual_sorted,
+            mode="markers",
+            marker=dict(color="#00ff87", size=12, symbol="diamond", line=dict(color="#0a0a0f", width=2)),
+        ))
+        fig_bar.update_layout(
+            plot_bgcolor="#111118", paper_bgcolor="#111118",
+            font=dict(family="DM Sans", color="#e8e8f0"),
+            legend=dict(bgcolor="#1a1a24", bordercolor="#2a2a3a", borderwidth=1),
+            xaxis=dict(gridcolor="#1a1a24", tickfont=dict(size=11)),
+            yaxis=dict(gridcolor="#1a1a24", title="Wins"),
+            margin=dict(l=10, r=10, t=20, b=10),
+            height=340,
+            bargap=0.3,
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
+
     with tab2:
         st.markdown('<div class="section-header">WIN DISTRIBUTION</div>', unsafe_allow_html=True)
-        selected_team = st.selectbox("Select team", options=results["team_names"], label_visibility="collapsed")
+        selected_team = st.selectbox("Select team", options=results["team_names"], key="win_dist_team")
         team_idx = results["team_names"].index(selected_team)
         team_wins_dist = results["wins_distribution"][:, team_idx]
         actual_wins_this_team = results["actual_wins_by_idx"][team_idx]
 
         bins = np.arange(0, int(team_wins_dist.max()) + 2) - 0.5
         hist_counts, bin_edges = np.histogram(team_wins_dist, bins=bins)
+        win_vals = ((bin_edges[:-1] + bin_edges[1:]) / 2).astype(int)
         hist_df = pd.DataFrame({
-            "Wins": ((bin_edges[:-1] + bin_edges[1:]) / 2).astype(int),
+            "Wins": win_vals,
             "Simulations": hist_counts,
             "Frequency (%)": (hist_counts / num_sims * 100).round(1)
         })
@@ -478,11 +548,54 @@ if run_simulation:
         with hc4: st.markdown(f'<div class="stat-card"><div class="stat-value">{p10}–{p90}</div><div class="stat-label">P10–P90 Range</div></div>', unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
-        st.bar_chart(hist_df.set_index("Wins")["Simulations"], use_container_width=True)
+
+        # ── Plotly histogram with actual-wins marker ─────────────────────────
+        bar_colors = []
+        for w in win_vals:
+            if w == actual_wins_this_team:
+                bar_colors.append("#00ff87")
+            elif p10 <= w <= p90:
+                bar_colors.append("rgba(79,156,249,0.75)")
+            else:
+                bar_colors.append("rgba(79,156,249,0.3)")
+
+        fig_hist = go.Figure()
+        fig_hist.add_trace(go.Bar(
+            x=win_vals, y=hist_counts,
+            marker_color=bar_colors,
+            marker_line_color="rgba(0,0,0,0.3)", marker_line_width=1,
+            customdata=hist_df["Frequency (%)"].values,
+            hovertemplate="<b>%{x} wins</b><br>%{y:,} simulations (%{customdata:.1f}%)<extra></extra>",
+        ))
+        # actual wins vertical line
+        fig_hist.add_vline(
+            x=actual_wins_this_team, line_width=2, line_dash="dash", line_color="#00ff87",
+            annotation_text=f"Actual: {actual_wins_this_team}W",
+            annotation_font=dict(color="#00ff87", family="DM Mono", size=12),
+            annotation_position="top",
+        )
+        # mean wins line
+        mean_w = results["mean_wins"][team_idx]
+        fig_hist.add_vline(
+            x=mean_w, line_width=2, line_dash="dot", line_color="#4f9cf9",
+            annotation_text=f"Avg: {mean_w:.1f}W",
+            annotation_font=dict(color="#4f9cf9", family="DM Mono", size=12),
+            annotation_position="top right",
+        )
+        fig_hist.update_layout(
+            plot_bgcolor="#111118", paper_bgcolor="#111118",
+            font=dict(family="DM Sans", color="#e8e8f0"),
+            xaxis=dict(gridcolor="#1a1a24", title="Wins", dtick=1),
+            yaxis=dict(gridcolor="#1a1a24", title="Simulations"),
+            margin=dict(l=10, r=10, t=30, b=10),
+            height=360,
+            showlegend=False,
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
 
         pct_better = float(np.mean(team_wins_dist > actual_wins_this_team) * 100)
         pct_worse = float(np.mean(team_wins_dist < actual_wins_this_team) * 100)
-        st.markdown(f'<div class="info-box">In {pct_better:.1f}% of simulations this team finished with <strong>more wins</strong> than they actually got. In {pct_worse:.1f}% they finished with fewer.</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="info-box">In {pct_better:.1f}% of simulations this team finished with <strong>more wins</strong> than they actually got. In {pct_worse:.1f}% they finished with fewer. <span style="color:#4f9cf9">■</span> shaded region = P10–P90 range.</div>', unsafe_allow_html=True)
 
         with st.expander("Full Distribution Table"):
             st.dataframe(hist_df, use_container_width=True, hide_index=True)
@@ -490,6 +603,31 @@ if run_simulation:
     with tab3:
         st.markdown('<div class="section-header">LUCK INDEX</div>', unsafe_allow_html=True)
         st.markdown('<div class="info-box"><strong>Luck Index = Actual Wins minus Simulation Expected Wins.</strong> Positive means the team won more games than their starters deserved on average — favorable opponent timing or opponents underperforming. Negative means they were robbed by variance.</div>', unsafe_allow_html=True)
+
+        # ── Plotly horizontal bar — luck index ───────────────────────────────
+        luck_df = luck_table.sort_values("Luck Index")
+        colors_luck = ["#ff6b35" if v >= 0 else "#4f9cf9" for v in luck_df["Luck Index"]]
+        fig_luck = go.Figure()
+        fig_luck.add_trace(go.Bar(
+            x=luck_df["Luck Index"], y=luck_df["Team"],
+            orientation="h",
+            marker_color=colors_luck,
+            marker_line_width=0,
+            customdata=np.stack([luck_df["Actual Wins"], luck_df["Sim Expected Wins"]], axis=-1),
+            hovertemplate="<b>%{y}</b><br>Luck Index: %{x:+.2f}<br>Actual: %{customdata[0]}W · Expected: %{customdata[1]:.1f}W<extra></extra>",
+        ))
+        fig_luck.add_vline(x=0, line_width=1, line_color="#3a3a50")
+        fig_luck.update_layout(
+            plot_bgcolor="#111118", paper_bgcolor="#111118",
+            font=dict(family="DM Sans", color="#e8e8f0"),
+            xaxis=dict(gridcolor="#1a1a24", title="Luck Index (wins above/below expected)", zeroline=False),
+            yaxis=dict(gridcolor="rgba(0,0,0,0)", tickfont=dict(size=12)),
+            margin=dict(l=10, r=10, t=20, b=10),
+            height=max(300, 40 * num_teams),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_luck, use_container_width=True)
+
         st.dataframe(
             luck_table, use_container_width=True,
             column_config={
@@ -500,6 +638,96 @@ if run_simulation:
             },
             hide_index=True, height=min(520, 70 + 38 * num_teams)
         )
+
+    with tab4:
+        st.markdown('<div class="section-header">SIMULATION CONVERGENCE</div>', unsafe_allow_html=True)
+        st.markdown('<div class="info-box">Shows how each team\'s expected win total stabilises as more bootstrap iterations are added. Flat lines = the estimate has converged. Wiggle = more sims would help. This is what the Monte Carlo engine is doing under the hood.</div>', unsafe_allow_html=True)
+
+        wins_dist = results["wins_distribution"]   # (num_sims, num_teams)
+        checkpoints = np.unique(np.round(np.geomspace(50, num_sims, 40)).astype(int))
+        checkpoints = checkpoints[checkpoints <= num_sims]
+
+        # compute running mean at each checkpoint for every team
+        running_means = np.zeros((len(checkpoints), num_teams), dtype=np.float32)
+        for ci, cp in enumerate(checkpoints):
+            running_means[ci] = wins_dist[:cp].mean(axis=0)
+
+        # colour palette — cycle through green → blue → orange
+        palette = px.colors.qualitative.Plotly + px.colors.qualitative.Dark24
+
+        conv_team = st.selectbox(
+            "Highlight team",
+            options=["All teams"] + results["team_names"],
+            key="conv_team_select",
+        )
+
+        fig_conv = go.Figure()
+        for ti, tname in enumerate(results["team_names"]):
+            is_highlight = (conv_team == "All teams") or (conv_team == tname)
+            col = palette[ti % len(palette)]
+            fig_conv.add_trace(go.Scatter(
+                x=checkpoints, y=running_means[:, ti],
+                mode="lines",
+                name=tname,
+                line=dict(
+                    color=col if is_highlight else "rgba(60,60,80,0.4)",
+                    width=2.5 if is_highlight else 1,
+                ),
+                opacity=1.0 if is_highlight else 0.4,
+                hovertemplate=f"<b>{tname}</b><br>After %{{x:,}} sims: %{{y:.2f}} expected wins<extra></extra>",
+            ))
+
+        fig_conv.update_layout(
+            plot_bgcolor="#111118", paper_bgcolor="#111118",
+            font=dict(family="DM Sans", color="#e8e8f0"),
+            xaxis=dict(gridcolor="#1a1a24", title="Bootstrap Iterations", type="log"),
+            yaxis=dict(gridcolor="#1a1a24", title="Running Mean Expected Wins"),
+            legend=dict(bgcolor="#1a1a24", bordercolor="#2a2a3a", borderwidth=1, font=dict(size=11)),
+            margin=dict(l=10, r=10, t=20, b=10),
+            height=420,
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_conv, use_container_width=True)
+
+        # ── Playoff probability convergence for selected/all teams ───────────
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<div class="section-header" style="font-size:1.2rem;">PLAYOFF PROBABILITY CONVERGENCE</div>', unsafe_allow_html=True)
+        num_playoff_teams = min(4, num_teams // 2)
+
+        running_playoff = np.zeros((len(checkpoints), num_teams), dtype=np.float32)
+        for ci, cp in enumerate(checkpoints):
+            sub = wins_dist[:cp]
+            sorted_sub = np.sort(sub, axis=1)
+            cutoff = sorted_sub[:, -num_playoff_teams]
+            running_playoff[ci] = np.mean(sub >= cutoff[:, np.newaxis], axis=0)
+
+        fig_poff = go.Figure()
+        for ti, tname in enumerate(results["team_names"]):
+            is_highlight = (conv_team == "All teams") or (conv_team == tname)
+            col = palette[ti % len(palette)]
+            fig_poff.add_trace(go.Scatter(
+                x=checkpoints, y=running_playoff[:, ti] * 100,
+                mode="lines",
+                name=tname,
+                line=dict(
+                    color=col if is_highlight else "rgba(60,60,80,0.4)",
+                    width=2.5 if is_highlight else 1,
+                ),
+                opacity=1.0 if is_highlight else 0.4,
+                showlegend=False,
+                hovertemplate=f"<b>{tname}</b><br>After %{{x:,}} sims: %{{y:.1f}}% playoff<extra></extra>",
+            ))
+        fig_poff.add_hline(y=50, line_width=1, line_dash="dot", line_color="#3a3a50")
+        fig_poff.update_layout(
+            plot_bgcolor="#111118", paper_bgcolor="#111118",
+            font=dict(family="DM Sans", color="#e8e8f0"),
+            xaxis=dict(gridcolor="#1a1a24", title="Bootstrap Iterations", type="log"),
+            yaxis=dict(gridcolor="#1a1a24", title="Playoff Probability (%)", range=[0, 102]),
+            margin=dict(l=10, r=10, t=20, b=10),
+            height=360,
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_poff, use_container_width=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("<div style='font-family:DM Mono,monospace;font-size:0.7rem;color:#3a3a50;text-align:center;letter-spacing:0.1em;'>SLEEPER SEASON SIM &nbsp;·&nbsp; BAYESIAN MONTE CARLO RESIMULATION &nbsp;·&nbsp; NUMPY VECTORIZED</div>", unsafe_allow_html=True)
