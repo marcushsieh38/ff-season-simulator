@@ -499,7 +499,7 @@ league_id_input = st.text_input("Completed Season League ID", placeholder="Paste
 num_sims = st.select_slider("Simulation Iterations", options=[1000, 2500, 5000, 10000], value=5000)
 st.markdown('<div class="info-box">Enter the League ID of a <strong>finished season</strong>. The sim replays every week using the real starters each team set and the actual matchup schedule, then compares what did happen to what should have happened across thousands of alternate universes.</div>', unsafe_allow_html=True)
 
-run_simulation = st.button("RESIMULATE SEASON", use_container_width=True)
+run_simulation = st.button("RESIMULATE SEASON", width="stretch")
 
 if run_simulation:
     if not league_id_input.strip():
@@ -551,54 +551,23 @@ if run_simulation:
     status_text.markdown(f'<div class="hero-sub">RUNNING {num_sims:,} ALTERNATE UNIVERSES...</div>', unsafe_allow_html=True)
     np.random.seed(42)
 
-    # ── live convergence chart during simulation ──────────────────────────────
-    palette = px.colors.qualitative.Plotly + px.colors.qualitative.Dark24
-    live_chart = st.empty()
-    live_stat_cols = st.columns(len(rosters_data) if len(rosters_data) <= 6 else 6)
-    live_stat_placeholders = [c.empty() for c in live_stat_cols]
+    # ── live convergence line chart during simulation ─────────────────────────
+    TEAM_COLORS = [
+        "#00ff87","#4f9cf9","#ff6b35","#ffd700","#c084fc","#34d399",
+        "#f87171","#60a5fa","#fb923c","#a78bfa","#4ade80","#f472b6",
+    ]
+    status_text.markdown('<div class="hero-sub">⚡ SIMULATING — WATCH ESTIMATES CONVERGE IN REAL TIME</div>', unsafe_allow_html=True)
+    live_label = st.empty()
+    live_chart  = st.empty()
+    live_chips  = st.empty()
 
-    def render_live_chart(completed, partial_wins, team_names):
-        """Render the live expected-wins convergence line chart."""
-        running_means = partial_wins.mean(axis=0)
-        fig = go.Figure()
-        for ti, tname in enumerate(team_names):
-            fig.add_trace(go.Bar(
-                x=[tname],
-                y=[float(running_means[ti])],
-                name=tname,
-                marker_color=palette[ti % len(palette)],
-                marker_line_width=0,
-                hovertemplate=f"<b>{tname}</b><br>%{{y:.2f}} expected wins after {completed:,} sims<extra></extra>",
-            ))
-        fig.update_layout(
-            plot_bgcolor="#111118", paper_bgcolor="#111118",
-            font=dict(family="DM Sans", color="#e8e8f0"),
-            title=dict(
-                text=f"<span style='font-family:DM Mono;font-size:0.75rem;color:#6b6b80;letter-spacing:0.1em;'>LIVE · {completed:,} / {num_sims:,} SIMULATIONS COMPLETE</span>",
-                x=0, xanchor="left",
-            ),
-            xaxis=dict(gridcolor="rgba(0,0,0,0)", tickangle=-30, tickfont=dict(size=11)),
-            yaxis=dict(gridcolor="#1a1a24", title="Expected Wins"),
-            margin=dict(l=10, r=10, t=44, b=10),
-            height=320,
-            showlegend=False,
-            bargap=0.25,
-        )
-        live_chart.plotly_chart(fig, use_container_width=True)
-        # mini stat chips under the chart — show current expected wins per team
-        for ti, placeholder in enumerate(live_stat_placeholders):
-            if ti < len(team_names):
-                ew = float(running_means[ti])
-                col_hex = palette[ti % len(palette)]
-                placeholder.markdown(
-                    f"<div style='background:#111118;border:1px solid #2a2a3a;border-top:2px solid {col_hex};"
-                    f"border-radius:8px;padding:0.5rem 0.75rem;text-align:center;'>"
-                    f"<div style='font-family:Bebas Neue,sans-serif;font-size:1.4rem;color:{col_hex};line-height:1;'>{ew:.1f}</div>"
-                    f"<div style='font-family:DM Mono,monospace;font-size:0.6rem;color:#6b6b80;text-transform:uppercase;"
-                    f"letter-spacing:0.08em;margin-top:0.2rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{team_names[ti][:14]}</div>"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
+    # per-team history: list of (completed, mean_wins) points
+    history_x = []          # shared x values: sims completed so far
+    history_y = []          # list-of-lists: one inner list per team
+
+    # actual wins won't be known until first yield — grab from roster_actual_wins
+    # keyed by roster_id; we'll map to team index once we see team_names_live
+    actual_wins_live = None
 
     results = None
     gen = run_resimulation_batched(
@@ -608,19 +577,128 @@ if run_simulation:
         roster_actual_wins=roster_actual_wins, num_regular_season_weeks=num_regular_season_weeks,
         num_simulations=num_sims, batch_size=max(100, num_sims // 20),
     )
+
     for yielded in gen:
         if len(yielded) == 4:
-            completed, partial_wins, team_names_live, _ = yielded
-            render_live_chart(completed, partial_wins, team_names_live)
-            pct = 55 + int((completed / num_sims) * 35)
-            progress_bar.progress(min(pct, 90))
+            completed, partial_wins, team_names_live, roster_ids_live = yielded
+            wins_so_far = partial_wins
         else:
-            completed, _, team_names_live, _, results = yielded
-            render_live_chart(completed, results["wins_distribution"], team_names_live)
+            completed, _, team_names_live, roster_ids_live, results = yielded
+            wins_so_far = results["wins_distribution"]
 
+        n_t = len(team_names_live)
+        running_means = wins_so_far.mean(axis=0)  # shape (n_teams,)
+
+        # build actual_wins_live once
+        if actual_wins_live is None:
+            actual_wins_live = [
+                roster_actual_wins.get(roster_ids_live[i], 0) for i in range(n_t)
+            ]
+            history_y = [[] for _ in range(n_t)]
+
+        history_x.append(completed)
+        for i in range(n_t):
+            history_y[i].append(float(running_means[i]))
+
+        # ── build Plotly figure from scratch each frame ───────────────────────
+        fig_live = go.Figure()
+
+        for i, tname in enumerate(team_names_live):
+            col = TEAM_COLORS[i % len(TEAM_COLORS)]
+            actual_w = actual_wins_live[i]
+
+            # dashed horizontal actual-wins line spanning full x range
+            fig_live.add_trace(go.Scatter(
+                x=[history_x[0], history_x[-1]],
+                y=[actual_w, actual_w],
+                mode="lines",
+                line=dict(color=col, width=1, dash="dash"),
+                opacity=0.45,
+                showlegend=False,
+                hoverinfo="skip",
+            ))
+
+            # solid running-mean line
+            fig_live.add_trace(go.Scatter(
+                x=history_x,
+                y=history_y[i],
+                mode="lines",
+                name=tname,
+                line=dict(color=col, width=2),
+                hovertemplate=(
+                    f"<b>{tname}</b><br>"
+                    f"After %{{x:,}} sims: %{{y:.2f}} exp wins<br>"
+                    f"Actual: {actual_w}W"
+                    "<extra></extra>"
+                ),
+            ))
+
+        # y-axis range: bracket all actual + expected wins with padding
+        all_y_vals = actual_wins_live + [v for row in history_y for v in row]
+        y_lo = max(0, min(all_y_vals) - 1.5)
+        y_hi = max(all_y_vals) + 1.5
+
+        fig_live.update_layout(
+            plot_bgcolor="#0a0a0f",
+            paper_bgcolor="#111118",
+            font=dict(family="DM Sans", color="#e8e8f0", size=11),
+            xaxis=dict(
+                title=dict(text="Simulations completed", font=dict(size=10, color="#6b6b80")),
+                gridcolor="#1a1a24", tickfont=dict(family="DM Mono", size=10),
+                range=[0, num_sims],
+            ),
+            yaxis=dict(
+                title=dict(text="Expected wins", font=dict(size=10, color="#6b6b80")),
+                gridcolor="#1a1a24", tickfont=dict(family="DM Mono", size=10),
+                range=[y_lo, y_hi],
+            ),
+            legend=dict(
+                bgcolor="rgba(17,17,24,0.9)", bordercolor="#2a2a3a", borderwidth=1,
+                font=dict(size=10), orientation="v",
+                x=1.01, xanchor="left", y=1, yanchor="top",
+            ),
+            margin=dict(l=10, r=140, t=10, b=10),
+            height=400,
+            hovermode="x unified",
+        )
+
+        live_label.markdown(
+            f"<div style='font-family:DM Mono,monospace;font-size:0.7rem;color:#6b6b80;"
+            f"letter-spacing:0.12em;text-transform:uppercase;padding:0.3rem 0;'>"
+            f"⚡ LIVE &nbsp;·&nbsp; {completed:,} / {num_sims:,} universes simulated"
+            f"&nbsp;·&nbsp; solid = running expected wins &nbsp;·&nbsp; dashed = actual finish</div>",
+            unsafe_allow_html=True,
+        )
+        live_chart.plotly_chart(fig_live, use_container_width=True, key=f"live_{completed}")
+
+        # stat chips
+        chip_html = "<div style='display:flex;flex-wrap:wrap;gap:0.35rem;margin-top:0.4rem;'>"
+        for i in range(n_t):
+            col = TEAM_COLORS[i % len(TEAM_COLORS)]
+            ew  = float(running_means[i])
+            aw  = actual_wins_live[i]
+            diff = ew - aw
+            diff_str = f"+{diff:.1f}" if diff >= 0 else f"{diff:.1f}"
+            chip_html += (
+                f"<div style='background:#111118;border:1px solid #2a2a3a;border-top:2px solid {col};"
+                f"border-radius:8px;padding:0.35rem 0.55rem;text-align:center;flex:1;min-width:72px;'>"
+                f"<div style='font-family:Bebas Neue,sans-serif;font-size:1.25rem;color:{col};line-height:1;'>{ew:.1f}</div>"
+                f"<div style='font-family:DM Mono,monospace;font-size:0.58rem;color:#6b6b80;margin-top:0.1rem;"
+                f"overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:88px;'>{team_names_live[i][:13]}</div>"
+                f"<div style='font-family:DM Mono,monospace;font-size:0.55rem;"
+                f"color:{"#ff6b35" if diff < -0.05 else "#00ff87" if diff > 0.05 else "#6b6b80"};'>"
+                f"actual {aw}W ({diff_str})</div>"
+                f"</div>"
+            )
+        chip_html += "</div>"
+        live_chips.markdown(chip_html, unsafe_allow_html=True)
+
+        pct = 55 + int((completed / num_sims) * 35)
+        progress_bar.progress(min(pct, 90))
+
+    live_label.empty()
     live_chart.empty()
-    for p in live_stat_placeholders:
-        p.empty()
+    live_chips.empty()
 
     progress_bar.progress(95)
     status_text.markdown('<div class="hero-sub">FINALIZING RESULTS...</div>', unsafe_allow_html=True)
@@ -716,7 +794,7 @@ if st.session_state.sim_results is not None:
             height=340,
             bargap=0.3,
         )
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_bar, width="stretch")
 
     with tab2:
         st.markdown('<div class="section-header">WIN DISTRIBUTION</div>', unsafe_allow_html=True)
@@ -785,7 +863,7 @@ if st.session_state.sim_results is not None:
             height=360,
             showlegend=False,
         )
-        st.plotly_chart(fig_hist, use_container_width=True)
+        st.plotly_chart(fig_hist, width="stretch")
 
         pct_better = float(np.mean(team_wins_dist > actual_wins_this_team) * 100)
         pct_worse = float(np.mean(team_wins_dist < actual_wins_this_team) * 100)
@@ -820,7 +898,7 @@ if st.session_state.sim_results is not None:
             height=max(300, 40 * num_teams),
             showlegend=False,
         )
-        st.plotly_chart(fig_luck, use_container_width=True)
+        st.plotly_chart(fig_luck, width="stretch")
 
         st.dataframe(
             luck_table, use_container_width=True,
@@ -881,7 +959,7 @@ if st.session_state.sim_results is not None:
             height=420,
             hovermode="x unified",
         )
-        st.plotly_chart(fig_conv, use_container_width=True)
+        st.plotly_chart(fig_conv, width="stretch")
 
         # ── Playoff probability convergence for selected/all teams ───────────
         st.markdown("<br>", unsafe_allow_html=True)
@@ -921,7 +999,7 @@ if st.session_state.sim_results is not None:
             height=360,
             hovermode="x unified",
         )
-        st.plotly_chart(fig_poff, use_container_width=True)
+        st.plotly_chart(fig_poff, width="stretch")
 
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("<div style='font-family:DM Mono,monospace;font-size:0.7rem;color:#3a3a50;text-align:center;letter-spacing:0.1em;'>SLEEPER SEASON SIM &nbsp;·&nbsp; BAYESIAN MONTE CARLO RESIMULATION &nbsp;·&nbsp; NUMPY VECTORIZED</div>", unsafe_allow_html=True)
