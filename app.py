@@ -564,6 +564,7 @@ if run_simulation:
     # per-team history: list of (completed, mean_wins) points
     history_x = []          # shared x values: sims completed so far
     history_y = []          # list-of-lists: one inner list per team
+    _live_frame = 0         # unique frame counter to avoid duplicate Streamlit keys
 
     # actual wins won't be known until first yield — grab from roster_actual_wins
     # keyed by roster_id; we'll map to team index once we see team_names_live
@@ -669,7 +670,8 @@ if run_simulation:
             f"&nbsp;·&nbsp; solid = running expected wins &nbsp;·&nbsp; dashed = actual finish</div>",
             unsafe_allow_html=True,
         )
-        live_chart.plotly_chart(fig_live, use_container_width=True, key=f"live_{completed}")
+        live_chart.plotly_chart(fig_live, width="stretch", key=f"live_{_live_frame}")
+        _live_frame += 1
 
         # stat chips
         chip_html = "<div style='display:flex;flex-wrap:wrap;gap:0.35rem;margin-top:0.4rem;'>"
