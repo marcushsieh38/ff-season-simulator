@@ -2,7 +2,6 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import requests
-import gc
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
@@ -176,22 +175,24 @@ def compute_positional_priors(all_players_data, player_stats):
     return positional_priors
 
 
-def compute_qb_receiver_correlations(starter_pids, all_players_data, player_stats):
+def compute_intra_team_correlations(starter_pids, all_players_data, player_stats):
+    """Compute QB->WR/TE (positive passing-game correlation) and QB->RB
+    (negative cannibalization: heavy passing = fewer RB touches) correlations."""
     qb_ids = [p for p in starter_pids if all_players_data.get(p, {}).get("position") == "QB" and p in player_stats]
-    rec_ids = [p for p in starter_pids if all_players_data.get(p, {}).get("position") in ("WR", "TE") and p in player_stats]
+    skill_ids = [p for p in starter_pids if all_players_data.get(p, {}).get("position") in ("WR", "TE", "RB") and p in player_stats]
     correlations = {}
     for qb_id in qb_ids:
         qs = player_stats[qb_id]["scores"]
         if len(qs) < 4:
             continue
-        for rec_id in rec_ids:
-            rs = player_stats[rec_id]["scores"]
+        for skill_id in skill_ids:
+            rs = player_stats[skill_id]["scores"]
             n = min(len(qs), len(rs))
             if n < 4:
                 continue
             qa, ra = np.array(qs[:n]), np.array(rs[:n])
             if np.std(qa) > 0 and np.std(ra) > 0:
-                correlations[(qb_id, rec_id)] = float(np.corrcoef(qa, ra)[0, 1])
+                correlations[(qb_id, skill_id)] = float(np.corrcoef(qa, ra)[0, 1])
     return correlations
 
 
@@ -232,17 +233,20 @@ def run_resimulation(
                 variances.append(prior["variance"])
         team_initial_means.append(np.array(means, dtype=np.float32) if means else np.array([0.0], dtype=np.float32))
         team_static_variances.append(np.array(variances, dtype=np.float32) if variances else np.array([1.0], dtype=np.float32))
-        team_correlations.append(compute_qb_receiver_correlations(starter_pids, all_players_data, player_stats))
+        team_correlations.append(compute_intra_team_correlations(starter_pids, all_players_data, player_stats))
 
     team_dynamic_means = [np.tile(base, (num_simulations, 1)).astype(np.float32) for base in team_initial_means]
 
     wins_matrix = np.zeros((num_simulations, num_teams), dtype=np.float32)
     points_matrix = np.zeros((num_simulations, num_teams), dtype=np.float32)
-    bayesian_prior_w, bayesian_obs_w = 3.0, 1.0
-    bayesian_total = bayesian_prior_w + bayesian_obs_w
+    # EMA decay: early weeks learn fast (prior dominates); later weeks trust
+    # accumulated evidence more. alpha rises from ~0.20 to ~0.45 over the season.
+    ema_min, ema_max = 0.20, 0.45
 
     for week_idx in range(num_regular_season_weeks):
         week_number = week_idx + 1
+        t = week_idx / max(num_regular_season_weeks - 1, 1)  # 0 → 1 over season
+        ema_alpha = ema_min + t * (ema_max - ema_min)
         week_team_scores = np.zeros((num_simulations, num_teams), dtype=np.float32)
 
         for team_idx, roster in enumerate(rosters_data):
@@ -264,22 +268,23 @@ def run_resimulation(
                 np.random.randn(num_simulations, len(all_pids)).astype(np.float32) * sigma_m + mu_m
             ).astype(np.float32)
 
-            team_dynamic_means[team_idx] = (bayesian_prior_w * current_means + bayesian_obs_w * raw_scores) / bayesian_total
+            # EMA update: blend prior mean toward observed score
+            team_dynamic_means[team_idx] = (1.0 - ema_alpha) * current_means + ema_alpha * raw_scores
 
             qb_entries = [(i, pid) for i, pid in enumerate(all_pids) if all_players_data.get(pid, {}).get("position") == "QB"]
             if qb_entries:
                 qb_col, qb_pid = qb_entries[0]
                 high_qb_mask = raw_scores[:, qb_col] > np.percentile(raw_scores[:, qb_col], 80)
                 for col_i, pid in enumerate(all_pids):
-                    if all_players_data.get(pid, {}).get("position") not in ("WR", "TE"):
+                    pos = all_players_data.get(pid, {}).get("position")
+                    if pos not in ("WR", "TE", "RB"):
                         continue
                     corr = team_correlations[team_idx].get((qb_pid, pid), 0.0)
                     if abs(corr) > 0.1:
+                        # WR/TE: positive corr boosts; RB: typically negative corr discounts
                         raw_scores[high_qb_mask, col_i] *= (1.0 + corr * 0.15)
 
             week_team_scores[:, team_idx] = np.sum(raw_scores[:, starter_cols], axis=1).astype(np.float32)
-            del raw_scores, mu_m, sigma_m
-            gc.collect()
 
         points_matrix += week_team_scores
 
@@ -288,9 +293,6 @@ def run_resimulation(
             if t1 is not None and t2 is not None:
                 wins_matrix[:, t1] += (week_team_scores[:, t1] > week_team_scores[:, t2]).astype(np.float32)
                 wins_matrix[:, t2] += (week_team_scores[:, t2] > week_team_scores[:, t1]).astype(np.float32)
-
-        del week_team_scores
-        gc.collect()
 
     num_playoff_teams = min(4, num_teams // 2)
     sorted_wins = np.sort(wins_matrix, axis=1)
@@ -314,7 +316,6 @@ def run_resimulation(
     }
 
     del wins_matrix, points_matrix, sorted_wins
-    gc.collect()
     return results
 
 
@@ -357,12 +358,12 @@ def run_resimulation_batched(
                 variances.append(prior["variance"])
         team_initial_means.append(np.array(means, dtype=np.float32) if means else np.array([0.0], dtype=np.float32))
         team_static_variances.append(np.array(variances, dtype=np.float32) if variances else np.array([1.0], dtype=np.float32))
-        team_correlations.append(compute_qb_receiver_correlations(starter_pids, all_players_data, player_stats))
+        team_correlations.append(compute_intra_team_correlations(starter_pids, all_players_data, player_stats))
 
     wins_matrix = np.zeros((num_simulations, num_teams), dtype=np.float32)
     points_matrix = np.zeros((num_simulations, num_teams), dtype=np.float32)
-    bayesian_prior_w, bayesian_obs_w = 3.0, 1.0
-    bayesian_total = bayesian_prior_w + bayesian_obs_w
+    # EMA decay: alpha rises from ema_min (week 1) to ema_max (final week)
+    ema_min, ema_max = 0.20, 0.45
 
     # Process in batches; each batch runs ALL weeks for batch_size simulations
     batches = list(range(0, num_simulations, batch_size))
@@ -374,6 +375,8 @@ def run_resimulation_batched(
 
         for week_idx in range(num_regular_season_weeks):
             week_number = week_idx + 1
+            t = week_idx / max(num_regular_season_weeks - 1, 1)
+            ema_alpha = ema_min + t * (ema_max - ema_min)
             week_team_scores = np.zeros((bs, num_teams), dtype=np.float32)
 
             for team_idx, roster in enumerate(rosters_data):
@@ -393,21 +396,23 @@ def run_resimulation_batched(
                 raw_scores = np.exp(
                     np.random.randn(bs, len(all_pids)).astype(np.float32) * sigma_m + mu_m
                 ).astype(np.float32)
-                team_dynamic_means[team_idx] = (bayesian_prior_w * current_means + bayesian_obs_w * raw_scores) / bayesian_total
+
+                # EMA update
+                team_dynamic_means[team_idx] = (1.0 - ema_alpha) * current_means + ema_alpha * raw_scores
 
                 qb_entries = [(i, pid) for i, pid in enumerate(all_pids) if all_players_data.get(pid, {}).get("position") == "QB"]
                 if qb_entries:
                     qb_col, qb_pid = qb_entries[0]
                     high_qb_mask = raw_scores[:, qb_col] > np.percentile(raw_scores[:, qb_col], 80)
                     for col_i, pid in enumerate(all_pids):
-                        if all_players_data.get(pid, {}).get("position") not in ("WR", "TE"):
+                        pos = all_players_data.get(pid, {}).get("position")
+                        if pos not in ("WR", "TE", "RB"):
                             continue
                         corr = team_correlations[team_idx].get((qb_pid, pid), 0.0)
                         if abs(corr) > 0.1:
                             raw_scores[high_qb_mask, col_i] *= (1.0 + corr * 0.15)
 
                 week_team_scores[:, team_idx] = np.sum(raw_scores[:, starter_cols], axis=1).astype(np.float32)
-                del raw_scores, mu_m, sigma_m
 
             points_matrix[batch_slice] += week_team_scores
             for rid1, rid2 in (actual_schedule[week_idx] if week_idx < len(actual_schedule) else []):
@@ -415,10 +420,6 @@ def run_resimulation_batched(
                 if t1 is not None and t2 is not None:
                     wins_matrix[batch_slice, t1] += (week_team_scores[:, t1] > week_team_scores[:, t2]).astype(np.float32)
                     wins_matrix[batch_slice, t2] += (week_team_scores[:, t2] > week_team_scores[:, t1]).astype(np.float32)
-            del week_team_scores
-
-        del team_dynamic_means
-        gc.collect()
 
         completed = batch_start + bs
         yield completed, wins_matrix[:completed].copy(), team_names, roster_ids
@@ -444,7 +445,6 @@ def run_resimulation_batched(
         "num_simulations": num_simulations,
     }
     del sorted_wins, points_matrix
-    gc.collect()
     yield completed, wins_matrix, team_names, roster_ids, results
 
 
@@ -603,17 +603,9 @@ if run_simulation:
         cutoff = sorted_w[:, -num_playoff_teams_live]
         running_poff = np.mean(wins_so_far[:completed] >= cutoff[:, np.newaxis], axis=0) * 100
 
-        # running std for confidence band
-        running_poff_std = np.zeros(n_t, dtype=np.float32)
-        if completed > 10:
-            chunk = wins_so_far[:completed]
-            sorted_c = np.sort(chunk, axis=1)
-            cut_c = sorted_c[:, -num_playoff_teams_live]
-            # bootstrap std via half/half split
-            half = completed // 2
-            p1 = np.mean(chunk[:half] >= cut_c[:half, np.newaxis], axis=0) * 100
-            p2 = np.mean(chunk[half:] >= cut_c[half:, np.newaxis], axis=0) * 100
-            running_poff_std = np.abs(p1 - p2) / 2.0
+        # Wilson binomial SE for each team's playoff probability
+        phat = running_poff / 100.0
+        running_poff_std = np.sqrt(np.maximum(phat * (1.0 - phat) / completed, 0.0)) * 100.0
 
         history_x.append(completed)
         for i in range(n_t):
@@ -632,19 +624,20 @@ if run_simulation:
             if len(history_x) >= 3:
                 upper = [min(100.0, v + std_val) for v in poff_vals]
                 lower = [max(0.0,   v - std_val) for v in poff_vals]
+                r_c, g_c, b_c = int(col[1:3], 16), int(col[3:5], 16), int(col[5:7], 16)
                 # upper bound (invisible line, fills downward)
                 fig_live.add_trace(go.Scatter(
                     x=history_x, y=upper,
                     mode="lines", line=dict(width=0),
                     showlegend=False, hoverinfo="skip",
-                    fillcolor=f"rgba({int(col[1:3],16)},{int(col[3:5],16)},{int(col[5:7],16)},0.08)",
+                    fillcolor=f"rgba({r_c},{g_c},{b_c},0.18)",
                 ))
                 # lower bound — fills up to upper
                 fig_live.add_trace(go.Scatter(
                     x=history_x, y=lower,
                     mode="lines", line=dict(width=0),
                     fill="tonexty",
-                    fillcolor=f"rgba({int(col[1:3],16)},{int(col[3:5],16)},{int(col[5:7],16)},0.08)",
+                    fillcolor=f"rgba({r_c},{g_c},{b_c},0.18)",
                     showlegend=False, hoverinfo="skip",
                 ))
 
@@ -675,7 +668,7 @@ if run_simulation:
             xaxis=dict(
                 title=dict(text="Simulations completed", font=dict(size=10, color="#6b6b80")),
                 gridcolor="#1a1a24", tickfont=dict(family="DM Mono", size=10),
-                range=[0, num_sims],
+                range=[0, completed],
             ),
             yaxis=dict(
                 title=dict(text="Playoff Probability (%)", font=dict(size=10, color="#6b6b80")),
@@ -960,13 +953,16 @@ if st.session_state.sim_results is not None:
         checkpoints = np.unique(np.round(np.geomspace(50, num_sims, 40)).astype(int))
         checkpoints = checkpoints[checkpoints <= num_sims]
 
-        # compute running mean + std at each checkpoint for every team
+        # compute running mean + visible spread band at each checkpoint
+        # std/sqrt(n) (SEM) is invisible at large n; use a fixed fraction of the
+        # win-distribution std so the band reflects realistic outcome spread.
         running_means = np.zeros((len(checkpoints), num_teams), dtype=np.float32)
         running_stds  = np.zeros((len(checkpoints), num_teams), dtype=np.float32)
         for ci, cp in enumerate(checkpoints):
             sub = wins_dist[:cp]
             running_means[ci] = sub.mean(axis=0)
-            running_stds[ci]  = sub.std(axis=0) / np.sqrt(cp)  # std error of mean
+            # Show ±0.5 sigma of the win distribution — visible but not overwhelming
+            running_stds[ci]  = sub.std(axis=0) * 0.5
 
         # league mean at each checkpoint for "above average" normalisation
         league_mean_by_cp = running_means.mean(axis=1, keepdims=True)  # (checkpoints, 1)
@@ -1000,7 +996,7 @@ if st.session_state.sim_results is not None:
 
             # hex → rgb for band fill
             r, g, b = int(col[1:3], 16), int(col[3:5], 16), int(col[5:7], 16)
-            band_alpha = 0.12 if is_highlight else 0.0
+            band_alpha = 0.20 if is_highlight else 0.0
 
             upper = [yv + sv for yv, sv in zip(yvals, se)]
             lower = [yv - sv for yv, sv in zip(yvals, se)]
@@ -1056,7 +1052,7 @@ if st.session_state.sim_results is not None:
             pvals = np.mean(sub >= cutoff[:, np.newaxis], axis=0)
             running_playoff[ci] = pvals * 100
             # Wilson-style std error for a proportion
-            running_playoff_se[ci] = np.sqrt(pvals * (1 - pvals) / cp) * 100
+            running_playoff_se[ci] = np.sqrt(pvals * (1 - pvals) / cp) * 100 * 2.0
 
         fig_poff = go.Figure()
         fig_poff.add_hline(y=50, line_width=1, line_dash="dot", line_color="#3a3a50",
@@ -1068,7 +1064,7 @@ if st.session_state.sim_results is not None:
             yvals = running_playoff[:, ti].tolist()
             se    = running_playoff_se[:, ti].tolist()
             r, g, b = int(col[1:3], 16), int(col[3:5], 16), int(col[5:7], 16)
-            band_alpha = 0.12 if is_highlight else 0.0
+            band_alpha = 0.20 if is_highlight else 0.0
 
             upper = [min(100.0, yv + sv) for yv, sv in zip(yvals, se)]
             lower = [max(0.0,   yv - sv) for yv, sv in zip(yvals, se)]
