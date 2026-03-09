@@ -556,19 +556,19 @@ if run_simulation:
         "#00ff87","#4f9cf9","#ff6b35","#ffd700","#c084fc","#34d399",
         "#f87171","#60a5fa","#fb923c","#a78bfa","#4ade80","#f472b6",
     ]
-    status_text.markdown('<div class="hero-sub">⚡ SIMULATING — WATCH ESTIMATES CONVERGE IN REAL TIME</div>', unsafe_allow_html=True)
+    status_text.markdown('<div class="hero-sub">⚡ SIMULATING — WATCH PLAYOFF ODDS CONVERGE IN REAL TIME</div>', unsafe_allow_html=True)
     live_label = st.empty()
     live_chart  = st.empty()
     live_chips  = st.empty()
 
-    # per-team history: list of (completed, mean_wins) points
+    # per-team history
     history_x = []          # shared x values: sims completed so far
-    history_y = []          # list-of-lists: one inner list per team
-    _live_frame = 0         # unique frame counter to avoid duplicate Streamlit keys
+    history_poff = []       # list-of-lists: running playoff % per team
+    history_wins = []       # list-of-lists: running mean wins per team (for chips)
+    _live_frame = 0
 
-    # actual wins won't be known until first yield — grab from roster_actual_wins
-    # keyed by roster_id; we'll map to team index once we see team_names_live
     actual_wins_live = None
+    num_playoff_teams_live = None
 
     results = None
     gen = run_resimulation_batched(
@@ -588,56 +588,85 @@ if run_simulation:
             wins_so_far = results["wins_distribution"]
 
         n_t = len(team_names_live)
-        running_means = wins_so_far.mean(axis=0)  # shape (n_teams,)
+        is_final = results is not None
 
-        # build actual_wins_live once
+        # initialise once
         if actual_wins_live is None:
-            actual_wins_live = [
-                roster_actual_wins.get(roster_ids_live[i], 0) for i in range(n_t)
-            ]
-            history_y = [[] for _ in range(n_t)]
+            actual_wins_live = [roster_actual_wins.get(roster_ids_live[i], 0) for i in range(n_t)]
+            num_playoff_teams_live = min(4, n_t // 2)
+            history_poff = [[] for _ in range(n_t)]
+            history_wins = [[] for _ in range(n_t)]
+
+        # running playoff probability
+        running_means = wins_so_far[:completed].mean(axis=0)
+        sorted_w = np.sort(wins_so_far[:completed], axis=1)
+        cutoff = sorted_w[:, -num_playoff_teams_live]
+        running_poff = np.mean(wins_so_far[:completed] >= cutoff[:, np.newaxis], axis=0) * 100
+
+        # running std for confidence band
+        running_poff_std = np.zeros(n_t, dtype=np.float32)
+        if completed > 10:
+            chunk = wins_so_far[:completed]
+            sorted_c = np.sort(chunk, axis=1)
+            cut_c = sorted_c[:, -num_playoff_teams_live]
+            # bootstrap std via half/half split
+            half = completed // 2
+            p1 = np.mean(chunk[:half] >= cut_c[:half, np.newaxis], axis=0) * 100
+            p2 = np.mean(chunk[half:] >= cut_c[half:, np.newaxis], axis=0) * 100
+            running_poff_std = np.abs(p1 - p2) / 2.0
 
         history_x.append(completed)
         for i in range(n_t):
-            history_y[i].append(float(running_means[i]))
+            history_poff[i].append(float(running_poff[i]))
+            history_wins[i].append(float(running_means[i]))
 
-        # ── build Plotly figure from scratch each frame ───────────────────────
+        # ── build Plotly figure ───────────────────────────────────────────────
         fig_live = go.Figure()
 
         for i, tname in enumerate(team_names_live):
             col = TEAM_COLORS[i % len(TEAM_COLORS)]
-            actual_w = actual_wins_live[i]
+            poff_vals = history_poff[i]
+            std_val = float(running_poff_std[i])
 
-            # dashed horizontal actual-wins line spanning full x range
-            fig_live.add_trace(go.Scatter(
-                x=[history_x[0], history_x[-1]],
-                y=[actual_w, actual_w],
-                mode="lines",
-                line=dict(color=col, width=1, dash="dash"),
-                opacity=0.45,
-                showlegend=False,
-                hoverinfo="skip",
-            ))
+            # shade ±1 std band (only once enough history)
+            if len(history_x) >= 3:
+                upper = [min(100.0, v + std_val) for v in poff_vals]
+                lower = [max(0.0,   v - std_val) for v in poff_vals]
+                # upper bound (invisible line, fills downward)
+                fig_live.add_trace(go.Scatter(
+                    x=history_x, y=upper,
+                    mode="lines", line=dict(width=0),
+                    showlegend=False, hoverinfo="skip",
+                    fillcolor=f"rgba({int(col[1:3],16)},{int(col[3:5],16)},{int(col[5:7],16)},0.08)",
+                ))
+                # lower bound — fills up to upper
+                fig_live.add_trace(go.Scatter(
+                    x=history_x, y=lower,
+                    mode="lines", line=dict(width=0),
+                    fill="tonexty",
+                    fillcolor=f"rgba({int(col[1:3],16)},{int(col[3:5],16)},{int(col[5:7],16)},0.08)",
+                    showlegend=False, hoverinfo="skip",
+                ))
 
-            # solid running-mean line
+            # actual playoff finish marker line (50% threshold reference)
+            # solid running playoff % line
             fig_live.add_trace(go.Scatter(
                 x=history_x,
-                y=history_y[i],
+                y=poff_vals,
                 mode="lines",
                 name=tname,
-                line=dict(color=col, width=2),
+                line=dict(color=col, width=2.5 if is_final else 2),
                 hovertemplate=(
                     f"<b>{tname}</b><br>"
-                    f"After %{{x:,}} sims: %{{y:.2f}} exp wins<br>"
-                    f"Actual: {actual_w}W"
+                    f"After %{{x:,}} sims: %{{y:.1f}}% playoff<br>"
+                    f"Exp wins: {history_wins[i][-1]:.1f} · Actual: {actual_wins_live[i]}W"
                     "<extra></extra>"
                 ),
             ))
 
-        # y-axis range: bracket all actual + expected wins with padding
-        all_y_vals = actual_wins_live + [v for row in history_y for v in row]
-        y_lo = max(0, min(all_y_vals) - 1.5)
-        y_hi = max(all_y_vals) + 1.5
+        # 50% reference line
+        fig_live.add_hline(y=50, line_width=1, line_dash="dot", line_color="#3a3a50",
+                           annotation_text="50%", annotation_font=dict(color="#3a3a50", size=9))
 
         fig_live.update_layout(
             plot_bgcolor="#0a0a0f",
@@ -649,9 +678,9 @@ if run_simulation:
                 range=[0, num_sims],
             ),
             yaxis=dict(
-                title=dict(text="Expected wins", font=dict(size=10, color="#6b6b80")),
+                title=dict(text="Playoff Probability (%)", font=dict(size=10, color="#6b6b80")),
                 gridcolor="#1a1a24", tickfont=dict(family="DM Mono", size=10),
-                range=[y_lo, y_hi],
+                range=[-2, 102],
             ),
             legend=dict(
                 bgcolor="rgba(17,17,24,0.9)", bordercolor="#2a2a3a", borderwidth=1,
@@ -659,37 +688,41 @@ if run_simulation:
                 x=1.01, xanchor="left", y=1, yanchor="top",
             ),
             margin=dict(l=10, r=140, t=10, b=10),
-            height=400,
+            height=420,
             hovermode="x unified",
         )
 
+        status_icon = "✅ CONVERGED" if is_final else "⚡ LIVE"
         live_label.markdown(
             f"<div style='font-family:DM Mono,monospace;font-size:0.7rem;color:#6b6b80;"
             f"letter-spacing:0.12em;text-transform:uppercase;padding:0.3rem 0;'>"
-            f"⚡ LIVE &nbsp;·&nbsp; {completed:,} / {num_sims:,} universes simulated"
-            f"&nbsp;·&nbsp; solid = running expected wins &nbsp;·&nbsp; dashed = actual finish</div>",
+            f"{status_icon} &nbsp;·&nbsp; {completed:,} / {num_sims:,} universes simulated"
+            f"&nbsp;·&nbsp; playoff probability convergence &nbsp;·&nbsp; shaded = uncertainty band</div>",
             unsafe_allow_html=True,
         )
         live_chart.plotly_chart(fig_live, width="stretch", key=f"live_{_live_frame}")
         _live_frame += 1
 
-        # stat chips
+        # stat chips — show playoff % + expected wins
         chip_html = "<div style='display:flex;flex-wrap:wrap;gap:0.35rem;margin-top:0.4rem;'>"
         for i in range(n_t):
             col = TEAM_COLORS[i % len(TEAM_COLORS)]
-            ew  = float(running_means[i])
-            aw  = actual_wins_live[i]
-            diff = ew - aw
-            diff_str = f"+{diff:.1f}" if diff >= 0 else f"{diff:.1f}"
+            poff_val = float(running_poff[i])
+            ew = float(running_means[i])
+            aw = actual_wins_live[i]
+            luck = ew - aw
+            luck_str = f"+{luck:.1f}" if luck >= 0 else f"{luck:.1f}"
+            luck_color = "#ff6b35" if luck < -0.05 else "#00ff87" if luck > 0.05 else "#6b6b80"
             chip_html += (
                 f"<div style='background:#111118;border:1px solid #2a2a3a;border-top:2px solid {col};"
-                f"border-radius:8px;padding:0.35rem 0.55rem;text-align:center;flex:1;min-width:72px;'>"
-                f"<div style='font-family:Bebas Neue,sans-serif;font-size:1.25rem;color:{col};line-height:1;'>{ew:.1f}</div>"
+                f"border-radius:8px;padding:0.35rem 0.55rem;text-align:center;flex:1;min-width:80px;'>"
+                f"<div style='font-family:Bebas Neue,sans-serif;font-size:1.25rem;color:{col};line-height:1;'>{poff_val:.0f}%</div>"
                 f"<div style='font-family:DM Mono,monospace;font-size:0.58rem;color:#6b6b80;margin-top:0.1rem;"
                 f"overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:88px;'>{team_names_live[i][:13]}</div>"
-                f"<div style='font-family:DM Mono,monospace;font-size:0.55rem;"
-                f"color:{"#ff6b35" if diff < -0.05 else "#00ff87" if diff > 0.05 else "#6b6b80"};'>"
-                f"actual {aw}W ({diff_str})</div>"
+                f"<div style='font-family:DM Mono,monospace;font-size:0.55rem;color:#a0a0b8;'>"
+                f"exp {ew:.1f}W</div>"
+                f"<div style='font-family:DM Mono,monospace;font-size:0.55rem;color:{luck_color};'>"
+                f"luck {luck_str}</div>"
                 f"</div>"
             )
         chip_html += "</div>"
@@ -698,9 +731,15 @@ if run_simulation:
         pct = 55 + int((completed / num_sims) * 35)
         progress_bar.progress(min(pct, 90))
 
-    live_label.empty()
-    live_chart.empty()
-    live_chips.empty()
+    # ── DO NOT clear live chart — let it persist as a summary ─────────────────
+    # Update label to show final converged state
+    live_label.markdown(
+        f"<div style='font-family:DM Mono,monospace;font-size:0.7rem;color:#00ff87;"
+        f"letter-spacing:0.12em;text-transform:uppercase;padding:0.3rem 0;'>"
+        f"✅ CONVERGED &nbsp;·&nbsp; {num_sims:,} universes simulated &nbsp;·&nbsp; "
+        f"playoff probability by team &nbsp;·&nbsp; shaded = uncertainty band</div>",
+        unsafe_allow_html=True,
+    )
 
     progress_bar.progress(95)
     status_text.markdown('<div class="hero-sub">FINALIZING RESULTS...</div>', unsafe_allow_html=True)
@@ -915,47 +954,87 @@ if st.session_state.sim_results is not None:
 
     with tab4:
         st.markdown('<div class="section-header">SIMULATION CONVERGENCE</div>', unsafe_allow_html=True)
-        st.markdown('<div class="info-box">Shows how each team\'s expected win total stabilises as more bootstrap iterations are added. Flat lines = the estimate has converged. Wiggle = more sims would help. This is what the Monte Carlo engine is doing under the hood.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="info-box">Shows how each team\'s expected win total and playoff probability stabilises as more iterations are added. Flat lines = converged. Wiggle = more sims would help. Shaded bands show ±1 std of uncertainty around each running estimate.</div>', unsafe_allow_html=True)
 
         wins_dist = results["wins_distribution"]   # (num_sims, num_teams)
         checkpoints = np.unique(np.round(np.geomspace(50, num_sims, 40)).astype(int))
         checkpoints = checkpoints[checkpoints <= num_sims]
 
-        # compute running mean at each checkpoint for every team
+        # compute running mean + std at each checkpoint for every team
         running_means = np.zeros((len(checkpoints), num_teams), dtype=np.float32)
+        running_stds  = np.zeros((len(checkpoints), num_teams), dtype=np.float32)
         for ci, cp in enumerate(checkpoints):
-            running_means[ci] = wins_dist[:cp].mean(axis=0)
+            sub = wins_dist[:cp]
+            running_means[ci] = sub.mean(axis=0)
+            running_stds[ci]  = sub.std(axis=0) / np.sqrt(cp)  # std error of mean
 
-        # colour palette — cycle through green → blue → orange
+        # league mean at each checkpoint for "above average" normalisation
+        league_mean_by_cp = running_means.mean(axis=1, keepdims=True)  # (checkpoints, 1)
+
+        # colour palette
         palette = px.colors.qualitative.Plotly + px.colors.qualitative.Dark24
 
-        conv_team = st.selectbox(
-            "Highlight team",
-            options=["All teams"] + results["team_names"],
-            key="conv_team_select",
-        )
+        conv_col1, conv_col2 = st.columns([2, 1])
+        with conv_col1:
+            conv_team = st.selectbox(
+                "Highlight team",
+                options=["All teams"] + results["team_names"],
+                key="conv_team_select",
+            )
+        with conv_col2:
+            show_above_avg = st.toggle("Show wins above league avg", value=False, key="above_avg_toggle")
+
+        y_data = running_means - league_mean_by_cp if show_above_avg else running_means
+        y_title = "Expected Wins Above League Avg" if show_above_avg else "Running Mean Expected Wins"
 
         fig_conv = go.Figure()
+        if show_above_avg:
+            fig_conv.add_hline(y=0, line_width=1, line_dash="dot", line_color="#3a3a50",
+                               annotation_text="League avg", annotation_font=dict(color="#3a3a50", size=9))
+
         for ti, tname in enumerate(results["team_names"]):
             is_highlight = (conv_team == "All teams") or (conv_team == tname)
             col = palette[ti % len(palette)]
+            yvals = y_data[:, ti].tolist()
+            se = running_stds[:, ti].tolist()
+
+            # hex → rgb for band fill
+            r, g, b = int(col[1:3], 16), int(col[3:5], 16), int(col[5:7], 16)
+            band_alpha = 0.12 if is_highlight else 0.0
+
+            upper = [yv + sv for yv, sv in zip(yvals, se)]
+            lower = [yv - sv for yv, sv in zip(yvals, se)]
+
+            if is_highlight:
+                fig_conv.add_trace(go.Scatter(
+                    x=checkpoints.tolist(), y=upper,
+                    mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip",
+                    fillcolor=f"rgba({r},{g},{b},{band_alpha})",
+                ))
+                fig_conv.add_trace(go.Scatter(
+                    x=checkpoints.tolist(), y=lower,
+                    mode="lines", line=dict(width=0), fill="tonexty",
+                    fillcolor=f"rgba({r},{g},{b},{band_alpha})",
+                    showlegend=False, hoverinfo="skip",
+                ))
+
             fig_conv.add_trace(go.Scatter(
-                x=checkpoints, y=running_means[:, ti],
+                x=checkpoints.tolist(), y=yvals,
                 mode="lines",
                 name=tname,
                 line=dict(
-                    color=col if is_highlight else "rgba(60,60,80,0.4)",
+                    color=col if is_highlight else "rgba(60,60,80,0.35)",
                     width=2.5 if is_highlight else 1,
                 ),
                 opacity=1.0 if is_highlight else 0.4,
-                hovertemplate=f"<b>{tname}</b><br>After %{{x:,}} sims: %{{y:.2f}} expected wins<extra></extra>",
+                hovertemplate=f"<b>{tname}</b><br>After %{{x:,}} sims: %{{y:.2f}} wins<extra></extra>",
             ))
 
         fig_conv.update_layout(
             plot_bgcolor="#111118", paper_bgcolor="#111118",
             font=dict(family="DM Sans", color="#e8e8f0"),
             xaxis=dict(gridcolor="#1a1a24", title="Bootstrap Iterations", type="log"),
-            yaxis=dict(gridcolor="#1a1a24", title="Running Mean Expected Wins"),
+            yaxis=dict(gridcolor="#1a1a24", title=y_title),
             legend=dict(bgcolor="#1a1a24", bordercolor="#2a2a3a", borderwidth=1, font=dict(size=11)),
             margin=dict(l=10, r=10, t=20, b=10),
             height=420,
@@ -968,30 +1047,58 @@ if st.session_state.sim_results is not None:
         st.markdown('<div class="section-header" style="font-size:1.2rem;">PLAYOFF PROBABILITY CONVERGENCE</div>', unsafe_allow_html=True)
         num_playoff_teams = min(4, num_teams // 2)
 
-        running_playoff = np.zeros((len(checkpoints), num_teams), dtype=np.float32)
+        running_playoff      = np.zeros((len(checkpoints), num_teams), dtype=np.float32)
+        running_playoff_se   = np.zeros((len(checkpoints), num_teams), dtype=np.float32)
         for ci, cp in enumerate(checkpoints):
             sub = wins_dist[:cp]
             sorted_sub = np.sort(sub, axis=1)
             cutoff = sorted_sub[:, -num_playoff_teams]
-            running_playoff[ci] = np.mean(sub >= cutoff[:, np.newaxis], axis=0)
+            pvals = np.mean(sub >= cutoff[:, np.newaxis], axis=0)
+            running_playoff[ci] = pvals * 100
+            # Wilson-style std error for a proportion
+            running_playoff_se[ci] = np.sqrt(pvals * (1 - pvals) / cp) * 100
 
         fig_poff = go.Figure()
+        fig_poff.add_hline(y=50, line_width=1, line_dash="dot", line_color="#3a3a50",
+                           annotation_text="50%", annotation_font=dict(color="#3a3a50", size=9))
+
         for ti, tname in enumerate(results["team_names"]):
             is_highlight = (conv_team == "All teams") or (conv_team == tname)
             col = palette[ti % len(palette)]
+            yvals = running_playoff[:, ti].tolist()
+            se    = running_playoff_se[:, ti].tolist()
+            r, g, b = int(col[1:3], 16), int(col[3:5], 16), int(col[5:7], 16)
+            band_alpha = 0.12 if is_highlight else 0.0
+
+            upper = [min(100.0, yv + sv) for yv, sv in zip(yvals, se)]
+            lower = [max(0.0,   yv - sv) for yv, sv in zip(yvals, se)]
+
+            if is_highlight:
+                fig_poff.add_trace(go.Scatter(
+                    x=checkpoints.tolist(), y=upper,
+                    mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip",
+                    fillcolor=f"rgba({r},{g},{b},{band_alpha})",
+                ))
+                fig_poff.add_trace(go.Scatter(
+                    x=checkpoints.tolist(), y=lower,
+                    mode="lines", line=dict(width=0), fill="tonexty",
+                    fillcolor=f"rgba({r},{g},{b},{band_alpha})",
+                    showlegend=False, hoverinfo="skip",
+                ))
+
             fig_poff.add_trace(go.Scatter(
-                x=checkpoints, y=running_playoff[:, ti] * 100,
+                x=checkpoints.tolist(), y=yvals,
                 mode="lines",
                 name=tname,
                 line=dict(
-                    color=col if is_highlight else "rgba(60,60,80,0.4)",
+                    color=col if is_highlight else "rgba(60,60,80,0.35)",
                     width=2.5 if is_highlight else 1,
                 ),
                 opacity=1.0 if is_highlight else 0.4,
                 showlegend=False,
                 hovertemplate=f"<b>{tname}</b><br>After %{{x:,}} sims: %{{y:.1f}}% playoff<extra></extra>",
             ))
-        fig_poff.add_hline(y=50, line_width=1, line_dash="dot", line_color="#3a3a50")
+
         fig_poff.update_layout(
             plot_bgcolor="#111118", paper_bgcolor="#111118",
             font=dict(family="DM Sans", color="#e8e8f0"),
