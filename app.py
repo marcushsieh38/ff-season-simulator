@@ -318,6 +318,136 @@ def run_resimulation(
     return results
 
 
+def run_resimulation_batched(
+    rosters_data, users_data, all_players_data, player_stats, positional_priors,
+    roster_starters_by_week, actual_schedule, roster_actual_wins,
+    num_regular_season_weeks, num_simulations, batch_size=250,
+):
+    """Identical math to run_resimulation but yields (completed_sims, partial_wins_matrix)
+    after every batch so the caller can render a live chart."""
+    num_teams = len(rosters_data)
+    user_map = {u["user_id"]: u.get("display_name", u["user_id"]) for u in users_data}
+    team_names = [user_map.get(r.get("owner_id", ""), f"Team {r['roster_id']}") for r in rosters_data]
+    roster_ids = [r["roster_id"] for r in rosters_data]
+    roster_id_to_idx = {rid: i for i, rid in enumerate(roster_ids)}
+    skill_positions = {"QB", "RB", "WR", "TE", "K"}
+
+    team_all_starter_pids = []
+    for roster in rosters_data:
+        rid = roster["roster_id"]
+        seen, ordered = set(), []
+        for week in range(1, num_regular_season_weeks + 1):
+            for pid in roster_starters_by_week.get(rid, {}).get(week, []):
+                if pid not in seen and all_players_data.get(pid, {}).get("position") in skill_positions:
+                    seen.add(pid)
+                    ordered.append(pid)
+        team_all_starter_pids.append(ordered)
+
+    team_initial_means, team_static_variances, team_correlations = [], [], []
+    for starter_pids in team_all_starter_pids:
+        means, variances = [], []
+        for pid in starter_pids:
+            if pid in player_stats:
+                means.append(player_stats[pid]["mean"])
+                variances.append(player_stats[pid]["variance"])
+            else:
+                pos = all_players_data.get(pid, {}).get("position", "WR")
+                prior = positional_priors.get(pos, {"mean": 8.0, "variance": 10.0})
+                means.append(prior["mean"])
+                variances.append(prior["variance"])
+        team_initial_means.append(np.array(means, dtype=np.float32) if means else np.array([0.0], dtype=np.float32))
+        team_static_variances.append(np.array(variances, dtype=np.float32) if variances else np.array([1.0], dtype=np.float32))
+        team_correlations.append(compute_qb_receiver_correlations(starter_pids, all_players_data, player_stats))
+
+    wins_matrix = np.zeros((num_simulations, num_teams), dtype=np.float32)
+    points_matrix = np.zeros((num_simulations, num_teams), dtype=np.float32)
+    bayesian_prior_w, bayesian_obs_w = 3.0, 1.0
+    bayesian_total = bayesian_prior_w + bayesian_obs_w
+
+    # Process in batches; each batch runs ALL weeks for batch_size simulations
+    batches = list(range(0, num_simulations, batch_size))
+    for batch_start in batches:
+        bs = min(batch_size, num_simulations - batch_start)
+        batch_slice = slice(batch_start, batch_start + bs)
+
+        team_dynamic_means = [np.tile(base, (bs, 1)).astype(np.float32) for base in team_initial_means]
+
+        for week_idx in range(num_regular_season_weeks):
+            week_number = week_idx + 1
+            week_team_scores = np.zeros((bs, num_teams), dtype=np.float32)
+
+            for team_idx, roster in enumerate(rosters_data):
+                rid = roster["roster_id"]
+                week_starter_pids = [
+                    pid for pid in roster_starters_by_week.get(rid, {}).get(week_number, [])
+                    if all_players_data.get(pid, {}).get("position") in skill_positions
+                ]
+                all_pids = team_all_starter_pids[team_idx]
+                pid_to_col = {pid: i for i, pid in enumerate(all_pids)}
+                starter_cols = [pid_to_col[pid] for pid in week_starter_pids if pid in pid_to_col]
+                if not all_pids or not starter_cols:
+                    continue
+
+                current_means = team_dynamic_means[team_idx]
+                mu_m, sigma_m = compute_lognormal_params_vectorized(current_means, team_static_variances[team_idx])
+                raw_scores = np.exp(
+                    np.random.randn(bs, len(all_pids)).astype(np.float32) * sigma_m + mu_m
+                ).astype(np.float32)
+                team_dynamic_means[team_idx] = (bayesian_prior_w * current_means + bayesian_obs_w * raw_scores) / bayesian_total
+
+                qb_entries = [(i, pid) for i, pid in enumerate(all_pids) if all_players_data.get(pid, {}).get("position") == "QB"]
+                if qb_entries:
+                    qb_col, qb_pid = qb_entries[0]
+                    high_qb_mask = raw_scores[:, qb_col] > np.percentile(raw_scores[:, qb_col], 80)
+                    for col_i, pid in enumerate(all_pids):
+                        if all_players_data.get(pid, {}).get("position") not in ("WR", "TE"):
+                            continue
+                        corr = team_correlations[team_idx].get((qb_pid, pid), 0.0)
+                        if abs(corr) > 0.1:
+                            raw_scores[high_qb_mask, col_i] *= (1.0 + corr * 0.15)
+
+                week_team_scores[:, team_idx] = np.sum(raw_scores[:, starter_cols], axis=1).astype(np.float32)
+                del raw_scores, mu_m, sigma_m
+
+            points_matrix[batch_slice] += week_team_scores
+            for rid1, rid2 in (actual_schedule[week_idx] if week_idx < len(actual_schedule) else []):
+                t1, t2 = roster_id_to_idx.get(rid1), roster_id_to_idx.get(rid2)
+                if t1 is not None and t2 is not None:
+                    wins_matrix[batch_slice, t1] += (week_team_scores[:, t1] > week_team_scores[:, t2]).astype(np.float32)
+                    wins_matrix[batch_slice, t2] += (week_team_scores[:, t2] > week_team_scores[:, t1]).astype(np.float32)
+            del week_team_scores
+
+        del team_dynamic_means
+        gc.collect()
+
+        completed = batch_start + bs
+        yield completed, wins_matrix[:completed].copy(), team_names, roster_ids
+
+    # Final stats
+    num_playoff_teams = min(4, num_teams // 2)
+    sorted_wins = np.sort(wins_matrix, axis=1)
+    playoff_probs = np.mean(wins_matrix >= sorted_wins[:, -num_playoff_teams][:, np.newaxis], axis=0)
+    mean_wins = np.mean(wins_matrix, axis=0)
+    std_wins = np.std(wins_matrix, axis=0)
+    mean_points = np.mean(points_matrix, axis=0)
+    actual_wins_by_idx = [roster_actual_wins.get(roster_ids[i], 0) for i in range(num_teams)]
+
+    results = {
+        "team_names": team_names,
+        "roster_ids": roster_ids,
+        "playoff_probs": playoff_probs.tolist(),
+        "mean_wins": mean_wins.tolist(),
+        "std_wins": std_wins.tolist(),
+        "mean_points": mean_points.tolist(),
+        "actual_wins_by_idx": actual_wins_by_idx,
+        "wins_distribution": wins_matrix,
+        "num_simulations": num_simulations,
+    }
+    del sorted_wins, points_matrix
+    gc.collect()
+    yield completed, wins_matrix, team_names, roster_ids, results
+
+
 def build_summary_table(rosters_data, results):
     rows = []
     for i, roster in enumerate(rosters_data):
@@ -420,13 +550,77 @@ if run_simulation:
     progress_bar.progress(55)
     status_text.markdown(f'<div class="hero-sub">RUNNING {num_sims:,} ALTERNATE UNIVERSES...</div>', unsafe_allow_html=True)
     np.random.seed(42)
-    results = run_resimulation(
+
+    # ── live convergence chart during simulation ──────────────────────────────
+    palette = px.colors.qualitative.Plotly + px.colors.qualitative.Dark24
+    live_chart = st.empty()
+    live_stat_cols = st.columns(len(rosters_data) if len(rosters_data) <= 6 else 6)
+    live_stat_placeholders = [c.empty() for c in live_stat_cols]
+
+    def render_live_chart(completed, partial_wins, team_names):
+        """Render the live expected-wins convergence line chart."""
+        running_means = partial_wins.mean(axis=0)
+        fig = go.Figure()
+        for ti, tname in enumerate(team_names):
+            fig.add_trace(go.Bar(
+                x=[tname],
+                y=[float(running_means[ti])],
+                name=tname,
+                marker_color=palette[ti % len(palette)],
+                marker_line_width=0,
+                hovertemplate=f"<b>{tname}</b><br>%{{y:.2f}} expected wins after {completed:,} sims<extra></extra>",
+            ))
+        fig.update_layout(
+            plot_bgcolor="#111118", paper_bgcolor="#111118",
+            font=dict(family="DM Sans", color="#e8e8f0"),
+            title=dict(
+                text=f"<span style='font-family:DM Mono;font-size:0.75rem;color:#6b6b80;letter-spacing:0.1em;'>LIVE · {completed:,} / {num_sims:,} SIMULATIONS COMPLETE</span>",
+                x=0, xanchor="left",
+            ),
+            xaxis=dict(gridcolor="rgba(0,0,0,0)", tickangle=-30, tickfont=dict(size=11)),
+            yaxis=dict(gridcolor="#1a1a24", title="Expected Wins"),
+            margin=dict(l=10, r=10, t=44, b=10),
+            height=320,
+            showlegend=False,
+            bargap=0.25,
+        )
+        live_chart.plotly_chart(fig, use_container_width=True)
+        # mini stat chips under the chart — show current expected wins per team
+        for ti, placeholder in enumerate(live_stat_placeholders):
+            if ti < len(team_names):
+                ew = float(running_means[ti])
+                col_hex = palette[ti % len(palette)]
+                placeholder.markdown(
+                    f"<div style='background:#111118;border:1px solid #2a2a3a;border-top:2px solid {col_hex};"
+                    f"border-radius:8px;padding:0.5rem 0.75rem;text-align:center;'>"
+                    f"<div style='font-family:Bebas Neue,sans-serif;font-size:1.4rem;color:{col_hex};line-height:1;'>{ew:.1f}</div>"
+                    f"<div style='font-family:DM Mono,monospace;font-size:0.6rem;color:#6b6b80;text-transform:uppercase;"
+                    f"letter-spacing:0.08em;margin-top:0.2rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{team_names[ti][:14]}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+    results = None
+    gen = run_resimulation_batched(
         rosters_data=rosters_data, users_data=users_data, all_players_data=all_players_data,
         player_stats=player_stats, positional_priors=positional_priors,
         roster_starters_by_week=roster_starters_by_week, actual_schedule=actual_schedule,
         roster_actual_wins=roster_actual_wins, num_regular_season_weeks=num_regular_season_weeks,
-        num_simulations=num_sims,
+        num_simulations=num_sims, batch_size=max(100, num_sims // 20),
     )
+    for yielded in gen:
+        if len(yielded) == 4:
+            completed, partial_wins, team_names_live, _ = yielded
+            render_live_chart(completed, partial_wins, team_names_live)
+            pct = 55 + int((completed / num_sims) * 35)
+            progress_bar.progress(min(pct, 90))
+        else:
+            completed, _, team_names_live, _, results = yielded
+            render_live_chart(completed, results["wins_distribution"], team_names_live)
+
+    live_chart.empty()
+    for p in live_stat_placeholders:
+        p.empty()
 
     progress_bar.progress(95)
     status_text.markdown('<div class="hero-sub">FINALIZING RESULTS...</div>', unsafe_allow_html=True)
@@ -484,7 +678,7 @@ if st.session_state.sim_results is not None:
                 "Actual Points": st.column_config.NumberColumn(format="%.1f"),
                 "Win Std Dev": st.column_config.NumberColumn(format="%.2f"),
             },
-            height=min(520, 70 + 38 * num_teams)
+            height=36 * (num_teams + 1) + 3
         )
 
         # ── Bar chart: actual wins vs sim expected wins ──────────────────────
@@ -636,7 +830,7 @@ if st.session_state.sim_results is not None:
                 "Actual Points": st.column_config.NumberColumn(format="%.1f"),
                 "Sim Points (Avg)": st.column_config.NumberColumn(format="%.1f"),
             },
-            hide_index=True, height=min(520, 70 + 38 * num_teams)
+            hide_index=True, height=36 * (num_teams + 1) + 3
         )
 
     with tab4:
